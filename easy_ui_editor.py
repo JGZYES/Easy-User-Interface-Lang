@@ -171,35 +171,77 @@ class EasyUISyntaxHighlighter(QSyntaxHighlighter):
     def __init__(self, parent=None):
         super().__init__(parent)
         
+        # 优化后的颜色方案
         self.highlight_formats = {
-            'tag': self._create_format(QColor(30, 144, 255), bold=True),
-            'attribute': self._create_format(QColor(144, 238, 144)),
-            'string': self._create_format(QColor(255, 165, 0)),
-            'keyword': self._create_format(QColor(199, 21, 133)),
-            'punctuation': self._create_format(QColor(169, 169, 169))
+            'comment': self._create_format(QColor(106, 153, 85), italic=True),  # 注释-绿色斜体
+            'tag': self._create_format(QColor(86, 156, 214), bold=True),       # 标签-亮蓝色加粗
+            'attribute': self._create_format(QColor(152, 221, 255)),           # 属性-青色
+            'string': self._create_format(QColor(242, 178, 66)),               # 字符串-橙色
+            'keyword': self._create_format(QColor(197, 134, 250)),             # 关键字-紫色
+            'punctuation': self._create_format(QColor(150, 150, 150))          # 标点-中灰色
         }
         
+        # 高亮规则
         self.highlight_rules = [
-            (r'^\w+(?==)', self.highlight_formats['tag']),
-            (r'(?<=[,=])\s*(id|options)(?==)', self.highlight_formats['keyword']),
-            (r'(?<==)\s*\w+(?=[=,;])', self.highlight_formats['attribute']),
-            (r'"[^"]*"', self.highlight_formats['string']),
-            (r'[=,;[\]]', self.highlight_formats['punctuation'])
+            (r'#.*$', self.highlight_formats['comment']),                     # #单行注释
+            (r'//.*$', self.highlight_formats['comment']),                    # //单行注释
+            (r'^\w+(?==)', self.highlight_formats['tag']),                     # 标签名
+            (r'(?<=[,=])\s*(id|options|type|readonly|min|max|value|rows|interval)(?==)', self.highlight_formats['keyword']),  # 关键字
+            (r'(?<==)\s*\w+(?=[=,;])', self.highlight_formats['attribute']),   # 属性值
+            (r'"[^"]*"', self.highlight_formats['string']),                    # 字符串
+            (r'[=,;[\]]', self.highlight_formats['punctuation'])               # 标点符号
         ]
 
-    def _create_format(self, color, bold=False):
+    def _create_format(self, color, bold=False, italic=False):
         text_format = QTextCharFormat()
         text_format.setForeground(color)
         if bold:
             text_format.setFontWeight(QFont.Bold)
+        if italic:
+            text_format.setFontItalic(True)
         return text_format
 
     def highlightBlock(self, text):
+        # 处理多行注释（/* */）
+        self.setCurrentBlockState(0)
+        start_index = 0
+        
+        # 检查上一行是否处于多行注释中
+        if self.previousBlockState() != 1:
+            # 从文本起始位置查找 /*
+            start_index = self._match_multiline(text, r'/\*', 1)
+            
+        # 循环处理所有多行注释
+        while start_index >= 0:
+            # 查找 */ 结束符
+            end_index = self._match_multiline(text, r'\*/', 0, start_index)
+            if end_index == -1:
+                # 没有找到结束符，标记当前行为多行注释中
+                self.setCurrentBlockState(1)
+                comment_length = len(text) - start_index
+                self.setFormat(start_index, comment_length, self.highlight_formats['comment'])
+                break
+            else:
+                # 找到结束符，高亮整个注释块
+                comment_length = end_index - start_index + 2  # +2 包含 */
+                self.setFormat(start_index, comment_length, self.highlight_formats['comment'])
+                # 继续查找下一个 /*
+                start_index = self._match_multiline(text, r'/\*', 1, end_index + 2)
+        
+        # 处理其他高亮规则
         for pattern, text_format in self.highlight_rules:
             for match in re.finditer(pattern, text):
                 start = match.start()
                 length = match.end() - start
                 self.setFormat(start, length, text_format)
+
+    def _match_multiline(self, text, pattern, state, start=0):
+        # 修复：使用字符串切片实现起始位置偏移
+        sliced_text = text[start:]
+        match = re.search(pattern, sliced_text, re.DOTALL)
+        if match:
+            return start + match.start()  # 加上偏移量
+        return -1
 
 
 class InterpreterSelector(QDialog):
@@ -898,7 +940,7 @@ class EasyUIEditor(QMainWindow):
         self.init_completion_words()
         self.init_status_bar()
         self.init_ui()
-        self.check_file_association()
+        self.check_file_association_prompt()  # 检查文件关联（带记忆功能）
         
         self.scan_interpreters(quick_scan=True)
         self.full_scan_interpreters_in_background()
@@ -962,19 +1004,52 @@ class EasyUIEditor(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("初始化中...")
     
-    def check_file_association(self):
-        if not FileAssociation.is_associated():
-            reply = QMessageBox.question(
-                self, "文件关联",
-                "尚未设置.eui文件关联，是否将.eui文件默认用此程序打开并设置图标？\n(需要管理员权限)",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
-            )
-            if reply == QMessageBox.Yes:
-                if FileAssociation.set_association():
-                    QMessageBox.information(self, "成功", "文件关联设置成功！\n可能需要重启资源管理器才能看到图标变化。")
-                    self.status_bar.showMessage("已成功设置.eui文件关联")
-        else:
+    # 带记忆功能的文件关联检查
+    def check_file_association_prompt(self):
+        # 检查是否已经设置过关联
+        if FileAssociation.is_associated():
             self.status_bar.showMessage(".eui文件已关联到此程序")
+            return
+        
+        # 检查是否已经提示过（使用注册表记录）
+        if self.has_prompted_association():
+            self.status_bar.showMessage(".eui文件未关联，可在工具菜单设置")
+            return
+        
+        # 首次未关联状态，显示提示
+        reply = QMessageBox.question(
+            self, "文件关联",
+            "尚未设置.eui文件关联，是否将.eui文件默认用此程序打开并设置图标？\n(需要管理员权限)",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+        )
+        
+        # 记录已提示状态
+        self.set_prompted_association(True)
+        
+        if reply == QMessageBox.Yes:
+            if FileAssociation.set_association():
+                QMessageBox.information(self, "成功", "文件关联设置成功！\n可能需要重启资源管理器才能看到图标变化。")
+                self.status_bar.showMessage("已成功设置.eui文件关联")
+        else:
+            self.status_bar.showMessage("已取消文件关联设置，可在工具菜单重新设置")
+
+    # 检查是否已提示过关联
+    def has_prompted_association(self):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\EasyUIEditor", 0, winreg.KEY_READ) as key:
+                prompted, _ = winreg.QueryValueEx(key, "AssociationPrompted")
+                return bool(prompted)
+        except WindowsError:
+            return False
+
+    # 设置已提示关联的标记
+    def set_prompted_association(self, value):
+        try:
+            key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\EasyUIEditor")
+            winreg.SetValueEx(key, "AssociationPrompted", 0, winreg.REG_DWORD, 1 if value else 0)
+            winreg.CloseKey(key)
+        except WindowsError:
+            pass  # 忽略注册表操作错误
     
     def init_ui(self):
         self.setWindowTitle("Easy Windows UI Editor - [未命名]")
@@ -1142,6 +1217,66 @@ class EasyUIEditor(QMainWindow):
         if index >= 0 and self.interpreter_combo.count() > 0:
             self.interpreter_path = self.interpreter_combo.currentData()
             self.status_bar.showMessage(f"已选择解释器: {os.path.basename(self.interpreter_path)}")
+    
+    def create_tool_bar(self):
+        toolbar = QToolBar("主工具栏")
+        self.addToolBar(toolbar)
+        
+        new_btn = QPushButton("新建")
+        new_btn.setToolTip("新建文件 (Ctrl+N)")
+        new_btn.clicked.connect(self.add_new_tab)
+        toolbar.addWidget(new_btn)
+        
+        open_btn = QPushButton("打开")
+        open_btn.setToolTip("打开文件 (Ctrl+O)")
+        open_btn.clicked.connect(self.open_file)
+        toolbar.addWidget(open_btn)
+        
+        change_dir_btn = QPushButton("更改目录")
+        change_dir_btn.setToolTip("更改文件树显示的目录")
+        change_dir_btn.clicked.connect(self.change_directory)
+        toolbar.addWidget(change_dir_btn)
+        
+        save_btn = QPushButton("保存")
+        save_btn.setToolTip("保存文件 (Ctrl+S)")
+        save_btn.clicked.connect(self.save_file)
+        toolbar.addWidget(save_btn)
+        
+        toolbar.addSeparator()
+        
+        run_btn = QPushButton("运行")
+        run_btn.setToolTip("运行代码 (F5)")
+        run_btn.clicked.connect(self.run_code)
+        run_btn.setStyleSheet("color: green; font-weight: bold;")
+        toolbar.addWidget(run_btn)
+        
+        stop_btn = QPushButton("停止")
+        stop_btn.setToolTip("停止运行 (Ctrl+F5)")
+        stop_btn.clicked.connect(self.stop_running)
+        stop_btn.setStyleSheet("color: red; font-weight: bold;")
+        toolbar.addWidget(stop_btn)
+        
+        interpreter_btn = QPushButton("解释器")
+        interpreter_btn.setToolTip("选择解释器")
+        interpreter_btn.clicked.connect(self.choose_interpreter)
+        toolbar.addWidget(interpreter_btn)
+        
+        full_scan_btn = QPushButton("全扫描")
+        full_scan_btn.setToolTip("全电脑后台搜索解释器")
+        full_scan_btn.clicked.connect(self.full_scan_interpreters_in_background)
+        full_scan_btn.setStyleSheet("color: #00ccff; font-weight: bold;")
+        toolbar.addWidget(full_scan_btn)
+        
+        force_scan_btn = QPushButton("强制全扫")
+        force_scan_btn.setToolTip("无限制扫描所有驱动器（确保找到全部解释器）")
+        force_scan_btn.setStyleSheet("color: orange; font-weight: bold;")
+        force_scan_btn.clicked.connect(self.force_full_scan)
+        toolbar.addWidget(force_scan_btn)
+        
+        clear_btn = QPushButton("清空")
+        clear_btn.setToolTip("清空编辑区")
+        clear_btn.clicked.connect(self.clear_current_tab)
+        toolbar.addWidget(clear_btn)
     
     def update_interpreter_combo(self, interpreter_paths):
         current_path = self.interpreter_path
@@ -1341,66 +1476,6 @@ class EasyUIEditor(QMainWindow):
         else:
             self.status_bar.showMessage("没有正在运行的进程")
     
-    def create_tool_bar(self):
-        toolbar = QToolBar("主工具栏")
-        self.addToolBar(toolbar)
-        
-        new_btn = QPushButton("新建")
-        new_btn.setToolTip("新建文件 (Ctrl+N)")
-        new_btn.clicked.connect(self.add_new_tab)
-        toolbar.addWidget(new_btn)
-        
-        open_btn = QPushButton("打开")
-        open_btn.setToolTip("打开文件 (Ctrl+O)")
-        open_btn.clicked.connect(self.open_file)
-        toolbar.addWidget(open_btn)
-        
-        change_dir_btn = QPushButton("更改目录")
-        change_dir_btn.setToolTip("更改文件树显示的目录")
-        change_dir_btn.clicked.connect(self.change_directory)
-        toolbar.addWidget(change_dir_btn)
-        
-        save_btn = QPushButton("保存")
-        save_btn.setToolTip("保存文件 (Ctrl+S)")
-        save_btn.clicked.connect(self.save_file)
-        toolbar.addWidget(save_btn)
-        
-        toolbar.addSeparator()
-        
-        run_btn = QPushButton("运行")
-        run_btn.setToolTip("运行代码 (F5)")
-        run_btn.clicked.connect(self.run_code)
-        run_btn.setStyleSheet("color: green; font-weight: bold;")
-        toolbar.addWidget(run_btn)
-        
-        stop_btn = QPushButton("停止")
-        stop_btn.setToolTip("停止运行 (Ctrl+F5)")
-        stop_btn.clicked.connect(self.stop_running)
-        stop_btn.setStyleSheet("color: red; font-weight: bold;")
-        toolbar.addWidget(stop_btn)
-        
-        interpreter_btn = QPushButton("解释器")
-        interpreter_btn.setToolTip("选择解释器")
-        interpreter_btn.clicked.connect(self.choose_interpreter)
-        toolbar.addWidget(interpreter_btn)
-        
-        full_scan_btn = QPushButton("全扫描")
-        full_scan_btn.setToolTip("全电脑后台搜索解释器")
-        full_scan_btn.clicked.connect(self.full_scan_interpreters_in_background)
-        full_scan_btn.setStyleSheet("color: #00ccff; font-weight: bold;")
-        toolbar.addWidget(full_scan_btn)
-        
-        force_scan_btn = QPushButton("强制全扫")
-        force_scan_btn.setToolTip("无限制扫描所有驱动器（确保找到全部解释器）")
-        force_scan_btn.setStyleSheet("color: orange; font-weight: bold;")
-        force_scan_btn.clicked.connect(self.force_full_scan)
-        toolbar.addWidget(force_scan_btn)
-        
-        clear_btn = QPushButton("清空")
-        clear_btn.setToolTip("清空编辑区")
-        clear_btn.clicked.connect(self.clear_current_tab)
-        toolbar.addWidget(clear_btn)
-    
     def add_help_dock(self):
         dock = QDockWidget("语法帮助", self)
         dock.setAllowedAreas(Qt.RightDockWidgetArea)
@@ -1408,141 +1483,196 @@ class EasyUIEditor(QMainWindow):
         help_content = QTextEdit()
         help_content.setReadOnly(True)
         help_content.setHtml("""
-        <h3>Easy Windows UI 语法参考 (类HTML格式)</h3>
-        <p>语法格式: <strong>标签名=属性1,属性2,...;</strong></p>
-        <p>每条语句以分号(;)结尾，属性之间用逗号(,)分隔</p>
+        <h3 style="color:#00ccff;">Easy Windows UI 语法参考 (v1.8 完整版)</h3>
+        <p style="font-size:14px;">核心语法：<strong>标签名=属性1=值1,属性2=值2,...;</strong> （每条语句必须以分号结尾）</p>
+        <p style="font-size:14px;">属性规则：字符串值需用双引号包裹，数值/布尔值直接写，列表用[]包裹（元素用逗号分隔）</p>
         
-        <table border="1" cellpadding="5" style="border-collapse:collapse; margin:10px 0;">
+        <h4 style="color:#4fc3f7; margin-top:20px;">📌 注释格式（支持语法高亮）</h4>
+        <div style="background-color:#2d2d2d; padding:10px; border-radius:5px; margin:10px 0; font-family:Consolas;">
+            <p style="color:#6A9955; margin:5px 0;"># 单行注释：# 开头（绿色斜体）</p>
+            <p style="color:#6A9955; margin:5px 0;">// 单行注释：// 开头（绿色斜体）</p>
+            <p style="color:#6A9955; margin:5px 0;">/* 多行注释：/* 开头，*/ 结尾 
+            <br>   支持跨越多行文本
+            <br>   全程绿色高亮 */</p>
+            <p style="color:#d4d4d4; margin:5px 0;">// 示例：带注释的代码
+            <br>window=title="测试窗口",width=500,height=300;# 行尾也可加注释</p>
+        </div>
+
+        <h4 style="color:#4fc3f7; margin-top:20px;">🎯 完整组件列表（含新增功能）</h4>
+        <table border="1" cellpadding="6" style="border-collapse:collapse; width:100%; margin:10px 0; font-size:13px;">
             <tr style="background-color:#2d2d2d;">
-                <th>组件类型</th>
-                <th>标签名</th>
-                <th>必选属性</th>
-                <th>可选属性</th>
-                <th>示例</th>
+                <th style="text-align:center; color:#00ccff;">组件类型</th>
+                <th style="text-align:center; color:#00ccff;">标签名</th>
+                <th style="text-align:center; color:#00ccff;">必选属性</th>
+                <th style="text-align:center; color:#00ccff;">可选属性</th>
+                <th style="text-align:center; color:#00ccff;">实战示例</th>
             </tr>
+            <!-- 基础组件 -->
             <tr>
-                <td>窗口</td>
+                <td>主窗口</td>
                 <td>window</td>
                 <td>title="窗口标题", width=数值, height=数值</td>
-                <td>icon="图标文件路径"</td>
-                <td>window=title="用户信息页",width=500,height=400,icon="icon.png";</td>
+                <td>icon="本地图标路径", tooltip="窗口提示"</td>
+                <td><code style="color:#f2b242;">window=title="用户管理系统",width=800,height=600,icon="logo.ico";</code></td>
             </tr>
             <tr>
-                <td>文字显示</td>
+                <td>文字标签</td>
                 <td>label</td>
-                <td>text="显示内容", id=组件ID</td>
-                <td>-</td>
-                <td>label=text="用户名",id=name_label;</td>
+                <td>text="显示文本", id=唯一ID</td>
+                <td>tooltip="鼠标悬浮提示"</td>
+                <td><code style="color:#f2b242;">label=text="用户名：",id=user_label,tooltip="请输入账号";</code></td>
             </tr>
             <tr>
                 <td>输入框</td>
                 <td>entry</td>
-                <td>hint="提示文本", id=组件ID</td>
-                <td>readonly=true/false, type=number/text</td>
-                <td>entry=hint="请输入姓名",id=name_input,readonly=false;</td>
+                <td>hint="占位提示", id=唯一ID</td>
+                <td>readonly=true/false, type=text/number</td>
+                <td><code style="color:#f2b242;">entry=hint="请输入手机号",id=phone_input,type=number,readonly=false;</code></td>
             </tr>
+            <!-- 选择类组件 -->
             <tr>
-                <td>选择框</td>
+                <td>下拉选择框</td>
                 <td>combo</td>
-                <td>label="选择标题", id=组件ID, options=[选项1,选项2]</td>
+                <td>label="选择标题", id=唯一ID, options=["选项1","选项2"]</td>
                 <td>-</td>
-                <td>combo=label="性别",id=gender_combo,options=["男","女","其他"];</td>
+                <td><code style="color:#f2b242;">combo=label="所属部门",id=dept_combo,options=["技术部","财务部","市场部"];</code></td>
             </tr>
             <tr>
-                <td>多选框</td>
+                <td>多选框组</td>
                 <td>checkbox</td>
-                <td>label="多选标题", id=组件ID, options=[选项1,选项2]</td>
+                <td>label="组标题", id=唯一ID, options=["选项1","选项2"]</td>
                 <td>-</td>
-                <td>checkbox=label="兴趣爱好",id=hobby_check,options=["读书","运动","编程"];</td>
-            </tr>
-            <tr>
-                <td>按钮</td>
-                <td>button</td>
-                <td>text="按钮文本", id=组件ID, click="触发动作"</td>
-                <td>-</td>
-                <td>button=text="提交",id=submit_btn,click="显示=name_input";</td>
-            </tr>
-            <tr>
-                <td>音频（网络）</td>
-                <td>audio</td>
-                <td>url="音乐网址", id=音频ID</td>
-                <td>-</td>
-                <td>audio=url="https://xxx.mp3",id=net_audio;</td>
-            </tr>
-            <tr>
-                <td>音频（本地）</td>
-                <td>audio</td>
-                <td>os="本地文件路径", id=音频ID</td>
-                <td>-</td>
-                <td>audio=os="music.mp3",id=local_audio;</td>
-            </tr>
-            <tr>
-                <td>滑块</td>
-                <td>slider</td>
-                <td>label="标题", id=ID, min=值, max=值, value=值</td>
-                <td>-</td>
-                <td>slider=label="音量",id=vol_slider,min=0,max=100,value=50;</td>
-            </tr>
-            <tr>
-                <td>文本区域</td>
-                <td>textarea</td>
-                <td>label="标题", id=ID, rows=行数</td>
-                <td>readonly=true/false</td>
-                <td>textarea=label="备注",id=note_area,rows=5,readonly=false;</td>
-            </tr>
-            <tr>
-                <td>分隔线</td>
-                <td>separator</td>
-                <td>id=ID</td>
-                <td>text="分隔文本"</td>
-                <td>separator=text="操作区",id=sep1;</td>
-            </tr>
-            <tr>
-                <td>进度条</td>
-                <td>progress</td>
-                <td>label="标题", id=ID, min=值, max=值, value=值</td>
-                <td>-</td>
-                <td>progress=label="完成度",id=prog_bar,min=0,max=100,value=30;</td>
-            </tr>
-            <tr>
-                <td>日历</td>
-                <td>calendar</td>
-                <td>label="标题", id=ID</td>
-                <td>-</td>
-                <td>calendar=label="选择日期",id=cal;</td>
+                <td><code style="color:#f2b242;">checkbox=label="兴趣爱好",id=hobby_check,options=["读书","编程","运动"];</code></td>
             </tr>
             <tr>
                 <td>单选按钮组</td>
                 <td>radiogroup</td>
-                <td>label="标题", id=ID, options=[选项1,...]</td>
+                <td>label="组标题", id=唯一ID, options=["选项1","选项2"]</td>
                 <td>-</td>
-                <td>radiogroup=label="学历",id=edu_radio,options=["本科","硕士","博士"];</td>
+                <td><code style="color:#f2b242;">radiogroup=label="性别",id=gender_radio,options=["男","女","其他"];</code></td>
+            </tr>
+            <!-- 多媒体组件 -->
+            <tr>
+                <td>网络音频</td>
+                <td>audio</td>
+                <td>url="音频地址", id=唯一ID</td>
+                <td>-</td>
+                <td><code style="color:#f2b242;">audio=url="https://xxx.mp3",id=net_audio;</code></td>
+            </tr>
+            <tr>
+                <td>本地音频</td>
+                <td>audio</td>
+                <td>os="本地路径", id=唯一ID</td>
+                <td>-</td>
+                <td><code style="color:#f2b242;">audio=os="music/background.mp3",id=local_audio;</code></td>
+            </tr>
+            <tr>
+                <td>图片显示</td>
+                <td>image</td>
+                <td>path="图片路径", id=唯一ID, width=数值, height=数值</td>
+                <td>tooltip="图片说明"</td>
+                <td><code style="color:#f2b242;">image=path="img/banner.png",id=banner_img,width=800,height=200,tooltip="顶部横幅";</code></td>
+            </tr>
+            <!-- 交互组件 -->
+            <tr>
+                <td>按钮</td>
+                <td>button</td>
+                <td>text="按钮文本", id=唯一ID, click="触发动作"</td>
+                <td>tooltip="按钮功能说明"</td>
+                <td><code style="color:#f2b242;">button=text="播放音乐",id=play_btn,click="play_audio=net_audio",tooltip="点击播放网络音乐";</code></td>
+            </tr>
+            <tr>
+                <td>滑块控件</td>
+                <td>slider</td>
+                <td>label="滑块标题", id=唯一ID, min=最小值, max=最大值, value=初始值</td>
+                <td>-</td>
+                <td><code style="color:#f2b242;">slider=label="音量调节",id=vol_slider,min=0,max=100,value=70;</code></td>
+            </tr>
+            <tr>
+                <td>文本区域</td>
+                <td>textarea</td>
+                <td>label="区域标题", id=唯一ID, rows=行数</td>
+                <td>readonly=true/false</td>
+                <td><code style="color:#f2b242;">textarea=label="备注信息",id=note_area,rows=5,readonly=false;</code></td>
+            </tr>
+            <tr>
+                <td>进度条</td>
+                <td>progress</td>
+                <td>label="进度标题", id=唯一ID, min=最小值, max=最大值, value=初始值</td>
+                <td>-</td>
+                <td><code style="color:#f2b242;">progress=label="下载进度",id=down_progress,min=0,max=100,value=30;</code></td>
+            </tr>
+            <tr>
+                <td>日历控件</td>
+                <td>calendar</td>
+                <td>label="选择标题", id=唯一ID</td>
+                <td>tooltip="选择日期"</td>
+                <td><code style="color:#f2b242;">calendar=label="生日选择",id=birth_cal,tooltip="点击选择出生日期";</code></td>
+            </tr>
+            <tr>
+                <td>分隔线</td>
+                <td>separator</td>
+                <td>id=唯一ID</td>
+                <td>text="分隔文本（居中显示）"</td>
+                <td><code style="color:#f2b242;">separator=text="用户信息区",id=sep1;</code></td>
             </tr>
             <tr>
                 <td>分组框</td>
                 <td>groupbox</td>
-                <td>title="标题", id=ID</td>
+                <td>title="分组标题", id=唯一ID</td>
                 <td>-</td>
-                <td>groupbox=title="用户信息",id=user_group;</td>
+                <td><code style="color:#f2b242;">groupbox=title="登录信息",id=login_group;</code></td>
             </tr>
+            <!-- 定时器（新增） -->
             <tr>
                 <td>定时器</td>
                 <td>timer</td>
-                <td>id=ID, interval=毫秒, action="动作"</td>
+                <td>id=唯一ID, interval=毫秒数, action="循环动作"</td>
                 <td>-</td>
-                <td>timer=id=timer1,interval=1000,action="update_progress=prog_bar,value=+1";</td>
+                <td><code style="color:#f2b242;">timer=id=progress_timer,interval=1000,action="update_progress=down_progress,value=+1";</code></td>
             </tr>
         </table>
-        
-        <h4>按钮动作说明:</h4>
-        <ul>
-            <li>显示组件内容: click="显示=组件ID"（支持输入框、选择框、多选框等）</li>
-            <li>播放音频: click="play_audio=音频ID"</li>
-            <li>暂停音频: click="pause_audio=音频ID"</li>
-            <li>停止音频: click="stop_audio=音频ID"</li>
-            <li>启动定时器: click="start_timer=定时器ID"</li>
-            <li>停止定时器: click="stop_timer=定时器ID"</li>
-            <li>设置进度条: click="set_progress=进度条ID,value=数值"</li>
+
+        <h4 style="color:#4fc3f7; margin-top:20px;">🔧 核心动作说明（按钮/定时器可用）</h4>
+        <div style="background-color:#2d2d2d; padding:15px; border-radius:5px; margin:10px 0;">
+            <h5 style="color:#ffcc00; margin:0 0 10px 0;">1. 组件控制动作</h5>
+            <ul style="margin:5px 0; padding-left:20px;">
+                <li><strong>显示组件内容</strong>：<code style="color:#f2b242;">显示=组件ID</code> → 弹窗显示输入框/选择框的当前值</li>
+                <li><strong>启动定时器</strong>：<code style="color:#f2b242;">start_timer=定时器ID</code> → 开始定时器循环</li>
+                <li><strong>停止定时器</strong>：<code style="color:#f2b242;">stop_timer=定时器ID</code> → 停止定时器循环</li>
+            </ul>
+            
+            <h5 style="color:#ffcc00; margin:15px 0 10px 0;">2. 音频控制动作</h5>
+            <ul style="margin:5px 0; padding-left:20px;">
+                <li><strong>播放音频</strong>：<code style="color:#f2b242;">play_audio=音频ID</code> → 播放指定音频（支持暂停后继续）</li>
+                <li><strong>暂停音频</strong>：<code style="color:#f2b242;">pause_audio=音频ID</code> → 暂停指定音频</li>
+                <li><strong>停止音频</strong>：<code style="color:#f2b242;">stop_audio=音频ID</code> → 停止指定音频（需重新播放）</li>
+            </ul>
+            
+            <h5 style="color:#ffcc00; margin:15px 0 10px 0;">3. 进度条控制动作（新增）</h5>
+            <ul style="margin:5px 0; padding-left:20px;">
+                <li><strong>设置固定值</strong>：<code style="color:#f2b242;">set_progress=进度条ID,value=数值</code> → 直接设置进度值（如：set_progress=down_progress,value=50）</li>
+                <li><strong>增量更新</strong>：<code style="color:#f2b242;">update_progress=进度条ID,value=±数值</code> → 增减进度值（如：update_progress=down_progress,value=+1）</li>
+            </ul>
+        </div>
+
+        <h4 style="color:#4fc3f7; margin-top:20px;">💡 语法高亮说明（编辑区视觉提示）</h4>
+        <div style="background-color:#2d2d2d; padding:10px; border-radius:5px; margin:10px 0;">
+            <p>• <span style="color:#6A9955; font-style:italic;">注释内容</span>（#、//、/* */）→ 绿色斜体</p>
+            <p>• <span style="color:#569CD6; font-weight:bold;">标签名</span>（window、label、audio等）→ 蓝色加粗</p>
+            <p>• <span style="color:#98DDFD;">属性名</span>（title、id、bind_volume等）→ 青色</p>
+            <p>• <span style="color:#F2B242;">字符串值</span>（""包裹的内容）→ 橙色</p>
+            <p>• <span style="color:#C586FA;">关键字</span>（true、false、text、number等）→ 紫色</p>
+            <p>• <span style="color:#969696;">标点符号</span>（=、,、;、[]等）→ 深灰色</p>
+        </div>
+
+        <h4 style="color:#4fc3f7; margin-top:20px;">⚠️ 常见错误提醒</h4>
+        <ul style="margin:10px 0; padding-left:20px;">
+            <li>语句必须以 <code style="color:#f2b242;">;</code> 结尾，否则解析失败</li>
+            <li>字符串（路径、文本）必须用双引号 <code style="color:#f2b242;">"</code> 包裹，数值/布尔值无需包裹</li>
+            <li>options列表内的选项需用双引号包裹，如：<code style="color:#f2b242;">options=["选项1","选项2"]</code></li>
+            <li>音频/图片路径若含中文，确保文件路径正确（建议使用相对路径）</li>
+            <li>bind_volume属性需指定存在的滑块ID，否则音量控制无效</li>
         </ul>
         """)
         
@@ -1856,28 +1986,39 @@ class EasyUIEditor(QMainWindow):
         return False
     
     def load_example_code(self):
-        example = """window=title="多媒体信息窗口",width=600,height=600,icon="app_icon.ico";
-label=text="多媒体演示程序",id=title_label;
-separator=text="用户信息",id=sep1;
+        example = """/*
+这是一个多媒体演示程序示例
+包含多种UI组件和注释用法
+*/
+window=title="多媒体信息窗口",width=600,height=600;  // 主窗口设置
+
+label=text="=== 多媒体演示程序 ===",id=title_label;  # 标题标签
+separator=text="用户信息",id=sep1;  // 分隔线
+
+// 用户信息输入区
 label=text="请输入您的昵称:",id=nickname_label;
 entry=hint="昵称",id=nickname_input;
+
+# 音乐偏好选择
 combo=label="喜欢的音乐类型",id=music_type,options=["流行","摇滚","古典","民谣"];
 checkbox=label="音乐功能",id=music_func,options=["播放网络音乐","播放本地音乐"];
 radiogroup=label="音质选择",id=quality_radio,options=["标准","高清","无损"];
+
+/* 音量控制
+   范围0-100，默认70 */
 slider=label="音量调节",id=vol_slider,min=0,max=100,value=70;
-separator=text="音乐控制",id=sep2;
-audio=url="https://example.com/music.mp3",id=net_music;
-audio=os="local_music.mp3",id=local_music;
+
+separator=text="音乐控制",id=sep2;  // 功能分隔
+
+// 音频组件（网络和本地）
+audio=url="https://lrgdmc.cn/static/mp3/jbd.mp3",id=net_music;  # 网络音频
+
+// 控制按钮
 button=text="显示信息",id=show_info,click="显示=nickname_input";
 button=text="播放网络音乐",id=play_net,click="play_audio=net_music";
-button=text="播放本地音乐",id=play_local,click="play_audio=local_music";
 button=text="暂停音乐",id=pause_music,click="pause_audio=net_music";
 button=text="停止音乐",id=stop_music,click="stop_audio=local_music";
-separator=text="进度演示",id=sep3;
-progress=label="播放进度",id=prog_bar,min=0,max=100,value=0;
-timer=id=progress_timer,interval=1000,action="update_progress=prog_bar,value=+1";
-button=text="开始进度",id=start_progress,click="start_timer=progress_timer";
-button=text="重置进度",id=reset_progress,click="set_progress=prog_bar,value=0";"""
+"""
         
         editor = self.get_current_editor()
         editor.setPlainText(example)
@@ -1885,7 +2026,7 @@ button=text="重置进度",id=reset_progress,click="set_progress=prog_bar,value=
     
     def show_about(self):
         QMessageBox.about(self, "关于 Easy Windows UI", 
-                         "Easy Windows UI 1.8\n\n新增功能：全电脑扫描所有解释器\n一个简单易用的UI创建工具，让您用极少的代码创建Windows界面。")
+                         "Easy Windows UI 1.8\n\n新增功能：优化注释高亮和文件关联记忆\n一个简单易用的UI创建工具，让您用极少的代码创建Windows界面。")
     
     def closeEvent(self, event):
         if hasattr(self, 'interpreter_thread') and self.interpreter_thread.isRunning():
