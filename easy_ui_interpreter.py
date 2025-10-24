@@ -1,38 +1,36 @@
 import sys
 import os
-import time
+import re
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QLineEdit, 
                             QComboBox, QCheckBox, QPushButton, QWidget, 
                             QVBoxLayout, QHBoxLayout, QMessageBox, QFrame,
                             QTextEdit, QSlider, QProgressBar, QCalendarWidget,
                             QGroupBox, QRadioButton)
-from PyQt5.QtCore import Qt, QUrl, QTimer
-from PyQt5.QtGui import QIcon, QIntValidator
+from PyQt5.QtCore import Qt, QUrl, QTimer, pyqtSlot
+from PyQt5.QtGui import QIcon, QIntValidator, QPixmap, QImage
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
-import re
+from urllib.request import urlopen
+from io import BytesIO
 
+# ---------------------- 核心解释器类 ----------------------
 class EasyUIInterpreter:
-    """Easy Windows UI解释器，解析并执行EWUI代码"""
-    
     def __init__(self):
         self.app = None
         self.window = None
-        self.widgets = {}  # 存储所有组件，键为id
-        self.variables = {}  # 存储组件关联的变量
+        self.widgets = {}  # 存储所有组件
+        self.variables = {}  # 存储可交互组件
         self.main_layout = None
-        self.media_players = {}  # 存储音频播放器实例
-        self.timers = {}  # 存储定时器实例
-        self.groups = {}  # 存储分组框实例
-    
+        self.media_players = {}
+        self.timers = {}  # 存储定时器
+        self.groups = {}
+
     def parse_and_run(self, code):
-        """解析并运行EWUI代码"""
-        # 确保只有一个QApplication实例
         if not QApplication.instance():
             self.app = QApplication(sys.argv)
         else:
             self.app = QApplication.instance()
         
-        # 清除之前的状态
+        # 重置UI状态
         self.widgets = {}
         self.variables = {}
         self.media_players = {}
@@ -41,31 +39,25 @@ class EasyUIInterpreter:
         self.window = None
         self.main_layout = None
         
-        # 按行解析代码
         lines = [line.strip() for line in code.split('\n') if line.strip()]
-        
         for line in lines:
             self.parse_line(line)
         
-        # 如果没有创建窗口，创建一个默认窗口
         if not self.window:
-            self.create_window("默认窗口", 400, 300)
+            self.create_window("EUI默认窗口", 400, 300)
         else:
-            # 添加一个拉伸项，确保所有组件都能显示
             self.main_layout.addStretch()
         
-        # 显示窗口并运行应用
         self.window.show()
         sys.exit(self.app.exec_())
-    
+
+    # ---------------------- 解析逻辑 ----------------------
     def parse_line(self, line):
-        """解析单行类HTML语法代码"""
-        # 移除行尾的;，统一处理
         line = line.strip().rstrip(';')
         if not line:
             return
 
-        # 1. 匹配窗口标签(支持可选图标参数): window=title="xxx",width=xxx,height=xxx[,icon="xxx"]
+        # 窗口配置
         window_pattern = r'window\s*=\s*title="([^"]+)"\s*,\s*width=(\d+)\s*,\s*height=(\d+)(?:\s*,\s*icon="([^"]+)")?'
         window_match = re.match(window_pattern, line)
         if window_match:
@@ -76,15 +68,13 @@ class EasyUIInterpreter:
             self.create_window(title, width, height, icon_path)
             return
 
-        # 2. 匹配文字标签: label=text="xxx",id=xxx
+        # 文字标签
         label_match = re.match(r'label\s*=\s*text="([^"]+)"\s*,\s*id=(\w+)', line)
         if label_match:
-            text = label_match.group(1)
-            widget_id = label_match.group(2)
-            self.create_label(text, widget_id)
+            self.create_label(label_match.group(1), label_match.group(2))
             return
 
-        # 3. 匹配输入框标签(支持只读属性): entry=hint="xxx",id=xxx[,readonly=true/false]
+        # 输入框
         entry_pattern = r'entry\s*=\s*hint="([^"]+)"\s*,\s*id=(\w+)(?:\s*,\s*readonly=(true|false))?(?:\s*,\s*type=(number|text))?'
         entry_match = re.match(entry_pattern, line)
         if entry_match:
@@ -95,160 +85,133 @@ class EasyUIInterpreter:
             self.create_entry(hint, widget_id, readonly, input_type)
             return
 
-        # 4. 匹配选择框标签: combo=label="xxx",id=xxx,options=[x,x,x]
+        # 下拉选择框
         combo_match = re.match(r'combo\s*=\s*label="([^"]+)"\s*,\s*id=(\w+)\s*,\s*options=\[(.*?)\]', line)
         if combo_match:
-            label = combo_match.group(1)
-            widget_id = combo_match.group(2)
             options = [opt.strip().strip('"') for opt in combo_match.group(3).split(',') if opt.strip()]
-            self.create_combobox(label, widget_id, options)
+            self.create_combobox(combo_match.group(1), combo_match.group(2), options)
             return
 
-        # 5. 匹配多选框标签: checkbox=label="xxx",id=xxx,options=[x,x,x]
+        # 多选框组
         check_match = re.match(r'checkbox\s*=\s*label="([^"]+)"\s*,\s*id=(\w+)\s*,\s*options=\[(.*?)\]', line)
         if check_match:
-            label = check_match.group(1)
-            widget_id = check_match.group(2)
             options = [opt.strip().strip('"') for opt in check_match.group(3).split(',') if opt.strip()]
-            self.create_checkboxes(label, widget_id, options)
+            self.create_checkboxes(check_match.group(1), check_match.group(2), options)
             return
 
-        # 6. 匹配按钮标签: button=text="xxx",id=xxx,click="xxx"
+        # 按钮
         button_match = re.match(r'button\s*=\s*text="([^"]+)"\s*,\s*id=(\w+)\s*,\s*click="([^"]+)"', line)
         if button_match:
-            text = button_match.group(1)
-            widget_id = button_match.group(2)
-            action = button_match.group(3)
-            self.create_button(text, widget_id, action)
+            self.create_button(button_match.group(1), button_match.group(2), button_match.group(3))
             return
-        
-        # 7. 匹配音频标签: 支持网络URL(audio=url="xxx",id=xxx)和本地文件(audio=os="xxx",id=xxx)
+
+        # 音频播放器
         audio_pattern = r'audio\s*=\s*(url|os)="([^"]+)"\s*,\s*id=(\w+)'
         audio_match = re.match(audio_pattern, line)
         if audio_match:
-            audio_type = audio_match.group(1)  # url或os
-            audio_path = audio_match.group(2)
-            audio_id = audio_match.group(3)
-            self.create_audio_player(audio_type, audio_path, audio_id)
+            self.create_audio_player(audio_match.group(1), audio_match.group(2), audio_match.group(3))
             return
-        
-        # 8. 匹配滑块控件: slider=label="xxx",id=xxx,min=xxx,max=xxx,value=xxx
+
+        # 图片组件解析 - 支持path、url、os三种格式
+        image_pattern = r'image\s*=\s*(path|url|os)="([^"]+)"\s*,\s*id=(\w+)(?:\s*,\s*width=(\d+))?(?:\s*,\s*height=(\d+))?(?:\s*,\s*tooltip="([^"]+)")?'
+        image_match = re.match(image_pattern, line)
+        if image_match:
+            img_type = image_match.group(1)  # path/url/os
+            img_path = image_match.group(2)  # 图片路径/URL
+            img_id = image_match.group(3)    # 组件ID
+            width = int(image_match.group(4)) if image_match.group(4) else None  # 可选宽度
+            height = int(image_match.group(5)) if image_match.group(5) else None  # 可选高度
+            tooltip = image_match.group(6) if image_match.group(6) else ""  # 可选提示文本
+            self.create_image(img_type, img_path, img_id, width, height, tooltip)
+            return
+
+        # 滑块控件
         slider_pattern = r'slider\s*=\s*label="([^"]+)"\s*,\s*id=(\w+)\s*,\s*min=(\d+)\s*,\s*max=(\d+)\s*,\s*value=(\d+)'
         slider_match = re.match(slider_pattern, line)
         if slider_match:
-            label = slider_match.group(1)
-            widget_id = slider_match.group(2)
-            min_val = int(slider_match.group(3))
-            max_val = int(slider_match.group(4))
-            value = int(slider_match.group(5))
-            self.create_slider(label, widget_id, min_val, max_val, value)
+            self.create_slider(
+                slider_match.group(1), slider_match.group(2),
+                int(slider_match.group(3)), int(slider_match.group(4)), int(slider_match.group(5))
+            )
             return
-        
-        # 9. 匹配文本区域: textarea=label="xxx",id=xxx,rows=xxx[,readonly=true/false]
+
+        # 文本区域
         textarea_pattern = r'textarea\s*=\s*label="([^"]+)"\s*,\s*id=(\w+)\s*,\s*rows=(\d+)(?:\s*,\s*readonly=(true|false))?'
         textarea_match = re.match(textarea_pattern, line)
         if textarea_match:
-            label = textarea_match.group(1)
-            widget_id = textarea_match.group(2)
-            rows = int(textarea_match.group(3))
             readonly = textarea_match.group(4).lower() == 'true' if textarea_match.group(4) else False
-            self.create_textarea(label, widget_id, rows, readonly)
+            self.create_textarea(textarea_match.group(1), textarea_match.group(2), int(textarea_match.group(3)), readonly)
             return
-        
-        # 10. 匹配分隔线: separator=text="xxx",id=xxx
+
+        # 分隔线
         separator_match = re.match(r'separator\s*=\s*text="([^"]*)"\s*,\s*id=(\w+)', line)
         if separator_match:
-            text = separator_match.group(1)
-            widget_id = separator_match.group(2)
-            self.create_separator(text, widget_id)
+            self.create_separator(separator_match.group(1), separator_match.group(2))
             return
-        
-        # 11. 匹配进度条: progress=label="xxx",id=xxx,min=xxx,max=xxx,value=xxx
+
+        # 进度条
         progress_pattern = r'progress\s*=\s*label="([^"]+)"\s*,\s*id=(\w+)\s*,\s*min=(\d+)\s*,\s*max=(\d+)\s*,\s*value=(\d+)'
         progress_match = re.match(progress_pattern, line)
         if progress_match:
-            label = progress_match.group(1)
-            widget_id = progress_match.group(2)
-            min_val = int(progress_match.group(3))
-            max_val = int(progress_match.group(4))
-            value = int(progress_match.group(5))
-            self.create_progressbar(label, widget_id, min_val, max_val, value)
+            self.create_progressbar(
+                progress_match.group(1), progress_match.group(2),
+                int(progress_match.group(3)), int(progress_match.group(4)), int(progress_match.group(5))
+            )
             return
-        
-        # 12. 匹配日历控件: calendar=label="xxx",id=xxx
+
+        # 日历控件
         calendar_match = re.match(r'calendar\s*=\s*label="([^"]+)"\s*,\s*id=(\w+)', line)
         if calendar_match:
-            label = calendar_match.group(1)
-            widget_id = calendar_match.group(2)
-            self.create_calendar(label, widget_id)
+            self.create_calendar(calendar_match.group(1), calendar_match.group(2))
             return
-        
-        # 13. 匹配单选按钮组: radiogroup=label="xxx",id=xxx,options=[x,x,x]
+
+        # 单选按钮组
         radio_match = re.match(r'radiogroup\s*=\s*label="([^"]+)"\s*,\s*id=(\w+)\s*,\s*options=\[(.*?)\]', line)
         if radio_match:
-            label = radio_match.group(1)
-            widget_id = radio_match.group(2)
             options = [opt.strip().strip('"') for opt in radio_match.group(3).split(',') if opt.strip()]
-            self.create_radiogroup(label, widget_id, options)
+            self.create_radiogroup(radio_match.group(1), radio_match.group(2), options)
             return
-        
-        # 14. 匹配分组框: groupbox=title="xxx",id=xxx
+
+        # 分组框
         groupbox_match = re.match(r'groupbox\s*=\s*title="([^"]+)"\s*,\s*id=(\w+)', line)
         if groupbox_match:
-            title = groupbox_match.group(1)
-            group_id = groupbox_match.group(2)
-            self.create_groupbox(title, group_id)
+            self.create_groupbox(groupbox_match.group(1), groupbox_match.group(2))
             return
-        
-        # 15. 匹配定时器: timer=id=xxx,interval=xxx,action="xxx"
+
+        # 定时器
         timer_pattern = r'timer\s*=\s*id=(\w+)\s*,\s*interval=(\d+)\s*,\s*action="([^"]+)"'
         timer_match = re.match(timer_pattern, line)
         if timer_match:
-            timer_id = timer_match.group(1)
-            interval = int(timer_match.group(2))
-            action = timer_match.group(3)
-            self.create_timer(timer_id, interval, action)
+            self.create_timer(timer_match.group(1), int(timer_match.group(2)), timer_match.group(3))
             return
-    
+
+    # ---------------------- 组件创建方法 ----------------------
     def create_window(self, title, width, height, icon_path=None):
-        """创建主窗口"""
         self.window = QMainWindow()
         self.window.setWindowTitle(title)
         self.window.resize(width, height)
         
-        # 设置窗口图标
-        if icon_path:
-            icon_path = icon_path.strip()
-            if os.path.exists(icon_path):
-                try:
-                    self.window.setWindowIcon(QIcon(icon_path))
-                except Exception as e:
-                    QMessageBox.warning(self.window, "警告", f"图标设置失败: {str(e)}")
-            else:
-                QMessageBox.warning(self.window, "警告", f"图标文件不存在: {icon_path}")
+        if icon_path and os.path.exists(icon_path):
+            try:
+                self.window.setWindowIcon(QIcon(icon_path))
+            except Exception as e:
+                QMessageBox.warning(self.window, "警告", f"图标设置失败：{str(e)}")
         
-        # 创建中心部件和布局
         central_widget = QWidget()
         self.window.setCentralWidget(central_widget)
-        
-        # 使用QVBoxLayout作为主布局，允许垂直排列组件
         self.main_layout = QVBoxLayout(central_widget)
         self.main_layout.setContentsMargins(20, 20, 20, 20)
         self.main_layout.setSpacing(15)
-    
+
     def create_label(self, text, widget_id):
-        """创建文字显示组件"""
         if not self.window:
             self.create_window("默认窗口", 400, 300)
-        
         label = QLabel(text)
         label.setMinimumHeight(30)
-        current_layout = self._get_current_layout()
-        current_layout.addWidget(label)
+        self._get_current_layout().addWidget(label)
         self.widgets[widget_id] = label
-    
+
     def create_entry(self, hint, widget_id, readonly=False, input_type='text'):
-        """创建输入框组件，支持数字类型"""
         if not self.window:
             self.create_window("默认窗口", 400, 300)
         
@@ -261,22 +224,16 @@ class EasyUIInterpreter:
         label = QLabel(hint)
         entry = QLineEdit()
         entry.setReadOnly(readonly)
-        
-        # 如果是数字类型，设置验证器
         if input_type == 'number':
             entry.setValidator(QIntValidator())
         
         layout.addWidget(label)
         layout.addWidget(entry)
-        
-        current_layout = self._get_current_layout()
-        current_layout.addWidget(container)
-        
+        self._get_current_layout().addWidget(container)
         self.widgets[widget_id] = entry
         self.variables[widget_id] = entry
-    
+
     def create_combobox(self, label_text, widget_id, options):
-        """创建选择框组件"""
         if not self.window:
             self.create_window("默认窗口", 400, 300)
         
@@ -292,15 +249,11 @@ class EasyUIInterpreter:
         
         layout.addWidget(label)
         layout.addWidget(combo)
-        
-        current_layout = self._get_current_layout()
-        current_layout.addWidget(container)
-        
+        self._get_current_layout().addWidget(container)
         self.widgets[widget_id] = combo
         self.variables[widget_id] = combo
-    
+
     def create_checkboxes(self, label_text, widget_id, options):
-        """创建多选框组件"""
         if not self.window:
             self.create_window("默认窗口", 400, 300)
         
@@ -310,71 +263,124 @@ class EasyUIInterpreter:
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
         
-        # 添加标题
         title_label = QLabel(label_text)
         layout.addWidget(title_label)
         
-        # 创建水平布局放置复选框
         check_layout = QHBoxLayout()
-        check_layout.setContentsMargins(0, 0, 0, 0)
         check_layout.setSpacing(15)
-        
         checkboxes = []
-        for option in options:
-            checkbox = QCheckBox(option)
-            check_layout.addWidget(checkbox)
-            checkboxes.append(checkbox)
+        for opt in options:
+            cb = QCheckBox(opt)
+            check_layout.addWidget(cb)
+            checkboxes.append(cb)
         
         layout.addLayout(check_layout)
-        
-        current_layout = self._get_current_layout()
-        current_layout.addWidget(container)
-        
+        self._get_current_layout().addWidget(container)
         self.widgets[widget_id] = checkboxes
         self.variables[widget_id] = checkboxes
-    
+
     def create_button(self, text, widget_id, action):
-        """创建按钮组件"""
         if not self.window:
             self.create_window("默认窗口", 400, 300)
         
         button = QPushButton(text)
         button.setMinimumHeight(30)
         button.setMaximumWidth(150)
-        
-        # 绑定点击事件
-        button.clicked.connect(lambda: self.handle_button_click(action))
-        
-        current_layout = self._get_current_layout()
-        current_layout.addWidget(button, alignment=Qt.AlignLeft)
+        button.clicked.connect(lambda checked, a=action: self.handle_button_click(a))
+        self._get_current_layout().addWidget(button, alignment=Qt.AlignLeft)
         self.widgets[widget_id] = button
-    
+
     def create_audio_player(self, audio_type, audio_path, audio_id):
-        """创建音频播放器（支持网络URL和本地文件）"""
         player = QMediaPlayer()
-        self.media_players[audio_id] = player  # 存储播放器实例
+        self.media_players[audio_id] = player
         
         try:
             if audio_type == "url":
-                # 网络音频：使用QUrl构建媒体内容
-                media_content = QMediaContent(QUrl(audio_path))
-            else:  # audio_type == "os"
-                # 本地音频：转换为绝对路径并构建QUrl
-                absolute_path = os.path.abspath(audio_path)
-                if not os.path.exists(absolute_path):
-                    QMessageBox.warning(self.window, "警告", f"本地音频文件不存在: {absolute_path}")
+                media = QMediaContent(QUrl(audio_path))
+            else:
+                abs_path = os.path.abspath(audio_path)
+                if not os.path.exists(abs_path):
                     return
-                media_content = QMediaContent(QUrl.fromLocalFile(absolute_path))
+                media = QMediaContent(QUrl.fromLocalFile(abs_path))
             
-            player.setMedia(media_content)
-            # 连接错误信号，捕获播放异常
-            player.error.connect(lambda err: self.handle_audio_error(audio_id, err))
-            QMessageBox.information(self.window, "提示", f"音频播放器创建成功（ID: {audio_id}）")
+            player.setMedia(media)
+        except Exception:
+            pass
+
+    # 图片组件创建方法（支持path自动识别）
+    def create_image(self, img_type, img_path, img_id, width=None, height=None, tooltip=""):
+        if not self.window:
+            self.create_window("默认窗口", 400, 300)
+        
+        # 创建图片标签容器
+        container = QWidget()
+        container.setMinimumHeight(height if height else 100)
+        container.setMinimumWidth(width if width else 100)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 创建图片标签
+        img_label = QLabel()
+        img_label.setToolTip(tooltip)
+        img_label.setAlignment(Qt.AlignCenter)
+        
+        # 加载图片
+        pixmap = None
+        try:
+            if img_type == "path":
+                # 自动识别：以http/https开头的视为网络图片，否则视为本地图片
+                if img_path.startswith(('http://', 'https://')):
+                    # 网络图片加载
+                    with urlopen(img_path) as response:
+                        img_data = response.read()
+                        image = QImage.fromData(img_data)
+                        pixmap = QPixmap.fromImage(image)
+                else:
+                    # 本地图片加载
+                    abs_path = os.path.abspath(img_path)
+                    if os.path.exists(abs_path):
+                        pixmap = QPixmap(abs_path)
+                    else:
+                        img_label.setText("图片文件不存在")
+                        QMessageBox.warning(self.window, "警告", f"本地图片路径不存在：{abs_path}")
+            
+            elif img_type == "url":
+                # 强制网络图片加载
+                with urlopen(img_path) as response:
+                    img_data = response.read()
+                    image = QImage.fromData(img_data)
+                    pixmap = QPixmap.fromImage(image)
+            
+            elif img_type == "os":
+                # 强制本地图片加载
+                abs_path = os.path.abspath(img_path)
+                if os.path.exists(abs_path):
+                    pixmap = QPixmap(abs_path)
+                else:
+                    img_label.setText("图片文件不存在")
+                    QMessageBox.warning(self.window, "警告", f"本地图片路径不存在：{abs_path}")
+        
         except Exception as e:
-            QMessageBox.critical(self.window, "错误", f"创建音频播放器失败: {str(e)}")
-    
+            img_label.setText("图片加载失败")
+            QMessageBox.warning(self.window, "警告", f"图片加载失败：{str(e)}")
+        
+        # 设置图片并调整大小
+        if pixmap and not pixmap.isNull():
+            if width and height:
+                pixmap = pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            elif width:
+                pixmap = pixmap.scaledToWidth(width, Qt.SmoothTransformation)
+            elif height:
+                pixmap = pixmap.scaledToHeight(height, Qt.SmoothTransformation)
+                
+            img_label.setPixmap(pixmap)
+        
+        layout.addWidget(img_label)
+        self._get_current_layout().addWidget(container)
+        self.widgets[img_id] = img_label
+        self.variables[img_id] = img_label
+
     def create_slider(self, label_text, widget_id, min_val, max_val, value):
-        """创建滑块控件"""
         if not self.window:
             self.create_window("默认窗口", 400, 300)
         
@@ -384,34 +390,21 @@ class EasyUIInterpreter:
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
         
-        # 显示当前值的标签
-        value_label = QLabel(f"{label_text}: {value}")
-        
-        # 创建滑块
+        value_label = QLabel(f"{label_text}：{value}")
         slider = QSlider(Qt.Horizontal)
-        slider.setMinimum(min_val)
-        slider.setMaximum(max_val)
+        slider.setRange(min_val, max_val)
         slider.setValue(value)
         slider.setTickInterval(1)
         slider.setTickPosition(QSlider.TicksBelow)
-        
-        # 滑块值变化时更新标签
-        def update_value():
-            value_label.setText(f"{label_text}: {slider.value()}")
-        
-        slider.valueChanged.connect(update_value)
+        slider.valueChanged.connect(lambda v: value_label.setText(f"{label_text}：{v}"))
         
         layout.addWidget(value_label)
         layout.addWidget(slider)
-        
-        current_layout = self._get_current_layout()
-        current_layout.addWidget(container)
-        
+        self._get_current_layout().addWidget(container)
         self.widgets[widget_id] = slider
         self.variables[widget_id] = slider
-    
+
     def create_textarea(self, label_text, widget_id, rows, readonly=False):
-        """创建文本区域"""
         if not self.window:
             self.create_window("默认窗口", 400, 300)
         
@@ -423,29 +416,19 @@ class EasyUIInterpreter:
         label = QLabel(label_text)
         textarea = QTextEdit()
         textarea.setReadOnly(readonly)
-        # 设置高度（每行约25像素）
         textarea.setMinimumHeight(rows * 25)
         
         layout.addWidget(label)
         layout.addWidget(textarea)
-        
-        current_layout = self._get_current_layout()
-        current_layout.addWidget(container)
-        
+        self._get_current_layout().addWidget(container)
         self.widgets[widget_id] = textarea
         self.variables[widget_id] = textarea
-    
+
     def create_separator(self, text, widget_id):
-        """创建分隔线，支持带文本"""
         if not self.window:
             self.create_window("默认窗口", 400, 300)
         
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
-        
         if text:
-            # 创建带文本的分隔线
             container = QWidget()
             layout = QHBoxLayout(container)
             layout.setContentsMargins(0, 0, 0, 0)
@@ -460,21 +443,20 @@ class EasyUIInterpreter:
             right_line.setFrameShadow(QFrame.Sunken)
             
             label = QLabel(text)
-            
             layout.addWidget(left_line, 1)
             layout.addWidget(label, 0, Qt.AlignCenter)
             layout.addWidget(right_line, 1)
             
-            current_layout = self._get_current_layout()
-            current_layout.addWidget(container)
+            self._get_current_layout().addWidget(container)
             self.widgets[widget_id] = container
         else:
-            current_layout = self._get_current_layout()
-            current_layout.addWidget(line)
+            line = QFrame()
+            line.setFrameShape(QFrame.HLine)
+            line.setFrameShadow(QFrame.Sunken)
+            self._get_current_layout().addWidget(line)
             self.widgets[widget_id] = line
-    
+
     def create_progressbar(self, label_text, widget_id, min_val, max_val, value):
-        """创建进度条"""
         if not self.window:
             self.create_window("默认窗口", 400, 300)
         
@@ -486,23 +468,17 @@ class EasyUIInterpreter:
         
         label = QLabel(label_text)
         progress = QProgressBar()
-        progress.setMinimum(min_val)
-        progress.setMaximum(max_val)
+        progress.setRange(min_val, max_val)
         progress.setValue(value)
-        # 显示百分比
         progress.setTextVisible(True)
         
         layout.addWidget(label)
         layout.addWidget(progress)
-        
-        current_layout = self._get_current_layout()
-        current_layout.addWidget(container)
-        
+        self._get_current_layout().addWidget(container)
         self.widgets[widget_id] = progress
         self.variables[widget_id] = progress
-    
+
     def create_calendar(self, label_text, widget_id):
-        """创建日历控件"""
         if not self.window:
             self.create_window("默认窗口", 400, 300)
         
@@ -513,20 +489,15 @@ class EasyUIInterpreter:
         
         label = QLabel(label_text)
         calendar = QCalendarWidget()
-        # 设置日期选择模式
         calendar.setSelectionMode(QCalendarWidget.SingleSelection)
         
         layout.addWidget(label)
         layout.addWidget(calendar)
-        
-        current_layout = self._get_current_layout()
-        current_layout.addWidget(container)
-        
+        self._get_current_layout().addWidget(container)
         self.widgets[widget_id] = calendar
         self.variables[widget_id] = calendar
-    
+
     def create_radiogroup(self, label_text, widget_id, options):
-        """创建单选按钮组"""
         if not self.window:
             self.create_window("默认窗口", 400, 300)
         
@@ -535,28 +506,22 @@ class EasyUIInterpreter:
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
         
-        # 添加标题
         title_label = QLabel(label_text)
         layout.addWidget(title_label)
         
-        # 创建按钮组
         radio_buttons = []
-        for i, option in enumerate(options):
-            radio = QRadioButton(option)
-            # 选中第一个选项
+        for i, opt in enumerate(options):
+            radio = QRadioButton(opt)
             if i == 0:
                 radio.setChecked(True)
             layout.addWidget(radio)
             radio_buttons.append(radio)
         
-        current_layout = self._get_current_layout()
-        current_layout.addWidget(container)
-        
+        self._get_current_layout().addWidget(container)
         self.widgets[widget_id] = radio_buttons
         self.variables[widget_id] = radio_buttons
-    
+
     def create_groupbox(self, title, group_id):
-        """创建分组框，后续控件会添加到该分组中"""
         if not self.window:
             self.create_window("默认窗口", 400, 300)
         
@@ -565,174 +530,164 @@ class EasyUIInterpreter:
         group_layout.setContentsMargins(15, 15, 15, 15)
         group_layout.setSpacing(10)
         
-        current_layout = self._get_current_layout()
-        current_layout.addWidget(groupbox)
-        
+        self._get_current_layout().addWidget(groupbox)
         self.groups[group_id] = group_layout
         self.widgets[group_id] = groupbox
-    
+
     def create_timer(self, timer_id, interval, action):
-        """创建定时器"""
+        if timer_id in self.timers:
+            self.timers[timer_id]['timer'].stop()
+            
         timer = QTimer()
-        timer.setInterval(interval)  # 毫秒
-        timer.timeout.connect(lambda: self.handle_timer_timeout(action))
-        
+        timer.setInterval(interval)
+        timer.timeout.connect(lambda: self.handle_timer_timeout(timer_id))
         self.timers[timer_id] = {
-            'timer': timer,
+            'timer': timer, 
             'action': action
         }
-        
-        QMessageBox.information(self.window, "提示", f"定时器创建成功（ID: {timer_id}，间隔: {interval}ms）")
-    
+
+    # ---------------------- 事件处理 ----------------------
     def _get_current_layout(self):
-        """获取当前活动布局（如果有分组框则使用分组框布局，否则使用主布局）"""
-        # 如果有分组框，返回最后一个分组框的布局
-        if self.groups:
-            return list(self.groups.values())[-1]
-        return self.main_layout
-    
-    def handle_audio_error(self, audio_id, error_code):
-        """处理音频播放错误"""
-        error_msg = f"音频播放错误（ID: {audio_id}），错误码: {error_code}"
-        QMessageBox.warning(self.window, "音频错误", error_msg)
-    
-    def handle_timer_timeout(self, action):
-        """处理定时器超时事件"""
-        # 支持更新进度条: update_progress=id,value=xxx
+        return list(self.groups.values())[-1] if self.groups else self.main_layout
+
+    @pyqtSlot()
+    def handle_timer_timeout(self, timer_id):
+        if timer_id not in self.timers:
+            return
+            
+        timer_info = self.timers[timer_id]
+        action = timer_info['action']
+        
         if action.startswith("update_progress="):
-            parts = action.split(",")
-            if len(parts) >= 2 and parts[0].startswith("update_progress="):
-                progress_id = parts[0].split("=")[1].strip()
-                value_part = parts[1].strip()
+            try:
+                progress_part, step_part = action.split(",")
+                progress_id = progress_part.split("=")[1].strip()
+                step = int(step_part.split("=")[1].strip())
                 
-                if value_part.startswith("value="):
-                    value = int(value_part.split("=")[1].strip())
-                    if progress_id in self.widgets and isinstance(self.widgets[progress_id], QProgressBar):
-                        progress = self.widgets[progress_id]
-                        progress.setValue(value)
-                        # 如果达到最大值，停止定时器
-                        if value >= progress.maximum():
-                            for timer in self.timers.values():
-                                if timer['action'] == action:
-                                    timer['timer'].stop()
-                                    break
-            return
-    
+                progress_bar = self.widgets.get(progress_id)
+                if not progress_bar or not isinstance(progress_bar, QProgressBar):
+                    return
+                
+                current_value = progress_bar.value()
+                new_value = current_value + step
+                new_value = max(progress_bar.minimum(), min(progress_bar.maximum(), new_value))
+                progress_bar.setValue(new_value)
+                
+                if new_value >= progress_bar.maximum():
+                    timer_info['timer'].stop()
+                    
+            except Exception as e:
+                QMessageBox.warning(self.window, "定时器错误", f"更新进度条失败：{str(e)}")
+
     def handle_button_click(self, action):
-        """处理按钮点击事件"""
-        # 音频控制：play_audio=id、pause_audio=id、stop_audio=id
         if action.startswith("play_audio="):
-            audio_id = action.split("=")[1].strip()
-            if audio_id in self.media_players:
-                self.media_players[audio_id].play()
-            else:
-                QMessageBox.warning(self.window, "警告", f"音频ID不存在: {audio_id}")
+            self._control_audio(action.split("=")[1], "play")
             return
-        
         if action.startswith("pause_audio="):
-            audio_id = action.split("=")[1].strip()
-            if audio_id in self.media_players:
-                self.media_players[audio_id].pause()
-            else:
-                QMessageBox.warning(self.window, "警告", f"音频ID不存在: {audio_id}")
+            self._control_audio(action.split("=")[1], "pause")
             return
-        
         if action.startswith("stop_audio="):
-            audio_id = action.split("=")[1].strip()
-            if audio_id in self.media_players:
-                self.media_players[audio_id].stop()
-            else:
-                QMessageBox.warning(self.window, "警告", f"音频ID不存在: {audio_id}")
+            self._control_audio(action.split("=")[1], "stop")
             return
         
-        # 定时器控制：start_timer=id、stop_timer=id
         if action.startswith("start_timer="):
             timer_id = action.split("=")[1].strip()
-            if timer_id in self.timers:
-                self.timers[timer_id]['timer'].start()
-                QMessageBox.information(self.window, "提示", f"定时器已启动（ID: {timer_id}）")
-            else:
-                QMessageBox.warning(self.window, "警告", f"定时器ID不存在: {timer_id}")
+            self._control_timer(timer_id, "start")
             return
-        
         if action.startswith("stop_timer="):
             timer_id = action.split("=")[1].strip()
-            if timer_id in self.timers:
-                self.timers[timer_id]['timer'].stop()
-                QMessageBox.information(self.window, "提示", f"定时器已停止（ID: {timer_id}）")
-            else:
-                QMessageBox.warning(self.window, "警告", f"定时器ID不存在: {timer_id}")
+            self._control_timer(timer_id, "stop")
             return
         
-        # 更新进度条
         if action.startswith("set_progress="):
             parts = action.split(",")
-            if len(parts) >= 2 and parts[0].startswith("set_progress="):
-                progress_id = parts[0].split("=")[1].strip()
-                value_part = parts[1].strip()
-                
-                if value_part.startswith("value="):
-                    try:
-                        value = int(value_part.split("=")[1].strip())
-                        if progress_id in self.widgets and isinstance(self.widgets[progress_id], QProgressBar):
-                            self.widgets[progress_id].setValue(value)
-                        else:
-                            QMessageBox.warning(self.window, "警告", f"进度条ID不存在: {progress_id}")
-                    except ValueError:
-                        QMessageBox.warning(self.window, "警告", "无效的进度值")
+            if len(parts) >= 2 and parts[1].startswith("value="):
+                try:
+                    p_id = parts[0].split("=")[1].strip()
+                    val = int(parts[1].split("=")[1].strip())
+                    if p_id in self.widgets and isinstance(self.widgets[p_id], QProgressBar):
+                        self.widgets[p_id].setValue(val)
+                except Exception as e:
+                    QMessageBox.warning(self.window, "错误", f"设置进度条失败：{str(e)}")
             return
         
-        # 显示组件值
-        if action.startswith("显示") and "=" in action:
-            _, target_id = action.split("=")
-            target_id = target_id.strip()
-            
-            if target_id in self.variables:
-                target = self.variables[target_id]
-                
-                if isinstance(target, list) and all(isinstance(x, QCheckBox) for x in target):
-                    # 处理多选框
-                    selected = [checkbox.text() for checkbox in target if checkbox.isChecked()]
-                    QMessageBox.information(self.window, "提示", f"选中项: {', '.join(selected)}")
-                elif isinstance(target, list) and all(isinstance(x, QRadioButton) for x in target):
-                    # 处理单选按钮组
-                    selected = [radio.text() for radio in target if radio.isChecked()]
-                    QMessageBox.information(self.window, "提示", f"选中项: {', '.join(selected)}")
-                elif isinstance(target, QComboBox):
-                    # 处理选择框
-                    QMessageBox.information(self.window, "提示", f"选择: {target.currentText()}")
-                elif isinstance(target, QLineEdit):
-                    # 处理输入框
-                    QMessageBox.information(self.window, "提示", f"输入: {target.text()}")
-                elif isinstance(target, QSlider):
-                    # 处理滑块
-                    QMessageBox.information(self.window, "提示", f"值: {target.value()}")
-                elif isinstance(target, QTextEdit):
-                    # 处理文本区域
-                    content = target.toPlainText()
-                    if len(content) > 100:
-                        content = content[:100] + "..."
-                    QMessageBox.information(self.window, "提示", f"内容: {content}")
-                elif isinstance(target, QCalendarWidget):
-                    # 处理日历
-                    date = target.selectedDate()
-                    QMessageBox.information(self.window, "提示", f"选中日期: {date.toString('yyyy-MM-dd')}")
-                elif isinstance(target, QProgressBar):
-                    # 处理进度条
-                    QMessageBox.information(self.window, "提示", f"进度: {target.value()}%")
-                else:
-                    QMessageBox.information(self.window, "提示", f"组件值: {str(target)}")
+        if action.startswith("显示="):
+            self._show_widget_value(action.split("=")[1].strip())
+            return
 
+    def _control_audio(self, audio_id, action):
+        if audio_id not in self.media_players:
+            return
+        player = self.media_players[audio_id]
+        if action == "play":
+            player.play()
+        elif action == "pause":
+            player.pause()
+        elif action == "stop":
+            player.stop()
 
-# 允许从命令行接收文件名参数
+    def _control_timer(self, timer_id, action):
+        if timer_id not in self.timers:
+            QMessageBox.warning(self.window, "警告", f"定时器ID不存在：{timer_id}")
+            return
+        timer = self.timers[timer_id]['timer']
+        if action == "start":
+            timer.start()
+        elif action == "stop":
+            timer.stop()
+
+    def _show_widget_value(self, widget_id):
+        if widget_id not in self.variables:
+            QMessageBox.warning(self.window, "警告", f"组件ID不存在：{widget_id}")
+            return
+        
+        target = self.variables[widget_id]
+        msg = ""
+        
+        if isinstance(target, list) and all(isinstance(x, QCheckBox) for x in target):
+            selected = [cb.text() for cb in target if cb.isChecked()]
+            msg = f"多选框选中项：{', '.join(selected) if selected else '无'}"
+        elif isinstance(target, list) and all(isinstance(x, QRadioButton) for x in target):
+            selected = [rb.text() for rb in target if rb.isChecked()]
+            msg = f"单选框选中项：{', '.join(selected)}"
+        elif isinstance(target, QComboBox):
+            msg = f"下拉框选中：{target.currentText()}"
+        elif isinstance(target, QLineEdit):
+            msg = f"输入框内容：{target.text()}"
+        elif isinstance(target, QSlider):
+            msg = f"滑块值：{target.value()}"
+        elif isinstance(target, QTextEdit):
+            content = target.toPlainText()
+            msg = f"文本区域内容：{content[:100]}..." if len(content) > 100 else f"文本区域内容：{content}"
+        elif isinstance(target, QCalendarWidget):
+            msg = f"选中日期：{target.selectedDate().toString('yyyy-MM-dd')}"
+        elif isinstance(target, QProgressBar):
+            msg = f"进度条值：{target.value()}%"
+        elif isinstance(target, QLabel) and hasattr(target, 'pixmap') and target.pixmap():
+            msg = f"图片信息：已加载图片（{target.pixmap().width()}x{target.pixmap().height()}）"
+        
+        QMessageBox.information(self.window, "组件值", msg)
+
+# ---------------------- 运行入口 ----------------------
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         file_path = sys.argv[1]
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                code = f.read()
+                ewui_code = f.read()
                 interpreter = EasyUIInterpreter()
-                interpreter.parse_and_run(code)
+                interpreter.parse_and_run(ewui_code)
         except Exception as e:
-            print(f"解释器错误: {str(e)}", file=sys.stderr)
+            print(f"[EUI解释器错误]：{str(e)}", file=sys.stderr)
             sys.exit(1)
+    else:
+        print("=" * 50)
+        print("Easy UI 解释器（支持path图片语法版）")
+        print("用法：python easy_ui_interpreter.py <EWUI文件路径>")
+        print("图片组件用法示例：")
+        print("window=title=\"图片示例\",width=800,height=600")
+        print("image=path=\"https://www.baidu.com/img/bd_logo1.png\",id=img1,width=300,tooltip=\"百度Logo\"")
+        print("image=path=\"./test.jpg\",id=img2,height=200,tooltip=\"本地图片\"")
+        print("button=text=\"显示图片信息\",id=btn_show,click=\"显示=img1\"")
+        print("=" * 50)
+        sys.exit(0)
